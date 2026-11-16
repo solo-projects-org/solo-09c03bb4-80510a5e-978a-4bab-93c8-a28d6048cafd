@@ -44,6 +44,7 @@ async function refresh() {
   renderEvents(s);
   renderDecodes(s);
   renderHistory(s);
+  renderCorrectionForm(s);
 }
 
 function renderStates(s) {
@@ -96,6 +97,8 @@ function renderEvents(s) {
   const tb = document.querySelector("#events-table tbody");
   tb.innerHTML = s.events.map((e) => `<tr>
       <td>${esc(e.id)}</td>
+      <td>${esc(e.entity_id)}<br/>修订 v${e.revision}
+        ${e.is_current ? '<span class="pill">当前</span>' : '<span class="pill">历史</span>'}</td>
       <td>v${e.writer_version}<div class="pill">${esc(e.writer_fp.slice(0, 8))}</div></td>
       <td><pre>${esc(pretty(e.payload))}</pre></td>
       <td>${esc(e.ingested_at)}</td>
@@ -103,7 +106,7 @@ function renderEvents(s) {
         <button onclick="decodeNow('${esc(e.id)}','analyzer-a')">A 解码</button>
         <button onclick="decodeNow('${esc(e.id)}','analyzer-b')">B 解码</button>
       </td>
-    </tr>`).join("") || `<tr><td colspan="5" class="hint">尚无留存事件</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="6" class="hint">尚无留存事件</td></tr>`;
 }
 
 function renderDecodes(s) {
@@ -182,6 +185,134 @@ $("btn-ingest-json").onclick = () => {
     showMsg("ingest-msg", "JSON 解析失败：" + e.message, false);
   }
 };
+
+// ---------------- 事件更正 ----------------
+// 载入表单时捕获“所见修订 + 所见写格式”，提交时原样带回；服务端据此拒绝
+// 交错的另一笔更正或写格式切换。
+let lastStatus = null;
+let corrSeen = null;  // {entity_id, revision, writer_fp, writer_version}
+
+function renderCorrectionForm(s) {
+  lastStatus = s;
+  const sel = $("corr-entity");
+  const prev = corrSeen ? corrSeen.entity_id : sel.value;
+  sel.innerHTML = (s.current_events || []).map((e) =>
+    `<option value="${esc(e.entity_id)}">${esc(e.entity_id)} · 修订 v${e.revision} · ` +
+    `${esc(e.id)} · 写格式 v${e.writer_version}</option>`).join("");
+  if (!s.current_events || !s.current_events.length) {
+    sel.innerHTML = `<option value="">（暂无当前有效事件）</option>`;
+  }
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+
+  if (corrSeen) {
+    const w = s.effective_writer;
+    const stale = w.fingerprint !== corrSeen.writer_fp;
+    const cur = (s.current_events || []).find(
+      (e) => e.entity_id === corrSeen.entity_id);
+    const revStale = !cur || cur.revision !== corrSeen.revision;
+    $("corr-seen").innerHTML =
+      `所见：实体 ${esc(corrSeen.entity_id)} · 修订 v${corrSeen.revision} · ` +
+      `写格式 v${corrSeen.writer_version} fp ${esc(corrSeen.writer_fp.slice(0, 8))}` +
+      (stale ? `<br/><span class="err-text">⚠ 生效写格式已变为 v${w.version} ` +
+               `fp ${esc(w.fingerprint.slice(0, 8))}，提交将被拒绝，请重新载入。</span>` : "") +
+      (revStale ? `<br/><span class="err-text">⚠ 该实体当前修订已变化，提交将被拒绝，请重新载入。</span>` : "");
+  }
+  if (sel.value) loadChain(sel.value);
+}
+
+$("btn-corr-load").onclick = () => {
+  const entityId = $("corr-entity").value;
+  const cur = (lastStatus && lastStatus.current_events || []).find(
+    (e) => e.entity_id === entityId);
+  if (!cur) {
+    showMsg("corr-msg", "请先在“当前有效事件”中选取一个事件。", false);
+    return;
+  }
+  corrSeen = {
+    entity_id: entityId,
+    revision: cur.revision,
+    writer_fp: lastStatus.effective_writer.fingerprint,
+    writer_version: lastStatus.effective_writer.version,
+  };
+  $("corr-payload").value = pretty(cur.payload);
+  showMsg("corr-msg",
+    `已载入 ${cur.id}（修订 v${cur.revision}）；所见写格式 ` +
+    `v${corrSeen.writer_version} fp ${corrSeen.writer_fp.slice(0, 8)}。`, true);
+  renderCorrectionForm(lastStatus);
+};
+
+$("btn-corr-submit").onclick = async () => {
+  if (!corrSeen) {
+    return showMsg("corr-msg", "请先“载入更正表单”，再提交更正。", false);
+  }
+  let payload;
+  try { payload = JSON.parse($("corr-payload").value); }
+  catch (e) { return showMsg("corr-msg", "JSON 解析失败：" + e.message, false); }
+  const reason = $("corr-reason").value.trim();
+  if (!reason) return showMsg("corr-msg", "请填写更正原因。", false);
+  try {
+    const r = await api("/api/corrections", {
+      method: "POST",
+      body: {
+        entity_id: corrSeen.entity_id,
+        seen_revision: corrSeen.revision,
+        seen_writer_fp: corrSeen.writer_fp,
+        payload,
+        reason,
+        decode_on: [
+          ...($("corr-dec-a").checked ? ["analyzer-a"] : []),
+          ...($("corr-dec-b").checked ? ["analyzer-b"] : []),
+        ],
+      },
+    });
+    let msg = `更正已生效：${r.old_event_id} → ${r.new_event_id}（修订 v${r.revision}，` +
+      `写格式 v${r.writer_version}，${r.size_bytes} 字节）；原事件字节与格式保留不变。`;
+    for (const d of r.decodes || []) {
+      msg += d.error
+        ? `\n[${d.analyzer_id}] 解码失败: ${d.error}`
+        : `\n[${d.analyzer_id}] 解码${d.decoded_ok ? "成功" : "失败"} reader=v${d.reader_version}`;
+    }
+    showMsg("corr-msg", msg, (r.decodes || []).every(
+      (d) => !d.error && d.decoded_ok !== false));
+    corrSeen = null;
+    $("corr-reason").value = "";
+    await refresh();
+  } catch (e) {
+    // 409 所见修订/写格式过期、422 编码失败：原当前事件不受影响
+    showMsg("corr-msg", "更正被拒绝（原当前事件保持不变）：\n" + e.message, false);
+    await refresh();
+  }
+};
+
+async function loadChain(entityId) {
+  let chain;
+  try {
+    chain = (await api(`/api/entities/${encodeURIComponent(entityId)}/revisions`)).chain;
+  } catch (e) {
+    $("corr-chain").innerHTML = `<div class="hint">修订链读取失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const revs = chain.revisions.slice().reverse().map((e) => `
+    <div class="switch-row">
+      <div class="meta">修订 v${e.revision}
+        ${e.is_current ? '<span class="badge confirmed">当前</span>'
+                       : '<span class="badge offline">历史</span>'}
+        · ${esc(e.id)} · 写格式 v${e.writer_version}
+        <span class="pill">fp ${esc(e.writer_fp.slice(0, 8))}</span> · ${esc(e.ingested_at)}</div>
+      <pre>${esc(pretty(e.payload))}</pre>
+      <button onclick="decodeNow('${esc(e.id)}','analyzer-a')">A 按原格式解码</button>
+      <button onclick="decodeNow('${esc(e.id)}','analyzer-b')">B 按原格式解码</button>
+    </div>`).join("");
+  const cors = chain.corrections.map((c) => `
+    <div class="meta">✎ ${esc(c.correction_id)} · 修订 v${c.seen_revision} → v${c.new_revision}
+      · ${esc(c.old_event_id)} → ${esc(c.new_event_id)} · 写格式 v${c.writer_version}
+      · ${esc(c.created_at)}<br/>原因：${esc(c.reason)}</div>`).join("");
+  $("corr-chain").innerHTML =
+    `<div class="meta">实体 ${esc(chain.entity_id)} · 当前修订 v${chain.current_revision}
+       （${esc(chain.current_event_id)}）</div>` +
+    (revs || '<div class="hint">无修订记录</div>') +
+    (cors ? `<h3>更正记录</h3>${cors}` : "");
+}
 
 // ---------------- 格式切换 ----------------
 $("btn-writer-switch").onclick = async () => {

@@ -171,6 +171,49 @@ def main():
     check("no pending reader switches",
           all(s["status"] != "pending" for s in st["reader_switches"]))
 
+    # 12. event correction: revision chain across write formats
+    cur = web.get("/api/events/current").json()["current_events"]
+    target = next(e for e in cur if e["payload"]["sample_id"] == "S-3")
+    entity, old_event = target["entity_id"], target["id"]
+    fp = web.get("/api/status").json()["effective_writer"]["fingerprint"]
+    r = web.post("/api/corrections", json={
+        "entity_id": entity, "seen_revision": 1, "seen_writer_fp": fp,
+        "payload": {"sample_id": "S-3", "project": "P3", "measurement": 7.5,
+                    "instrument_id": "GC-9", "tags": [], "batch_no": "B-1"},
+        "reason": "测值录错，7.0 应为 7.5",
+        "decode_on": ["analyzer-a", "analyzer-b"]})
+    check("correction confirmed at effective writer v3",
+          r.status_code == 200 and r.json()["revision"] == 2
+          and r.json()["writer_version"] == 3, r.text)
+    check("corrected event decoded by both analyzers",
+          all(d["decoded_ok"] for d in r.json()["decodes"]))
+    cur = web.get("/api/events/current").json()["current_events"]
+    mine = next(e for e in cur if e["entity_id"] == entity)
+    check("current query returns only the corrected revision",
+          mine["revision"] == 2 and mine["payload"]["measurement"] == 7.5)
+    chain = web.get(f"/api/entities/{entity}/revisions").json()["chain"]
+    check("revision chain keeps v2 original + v3 correction",
+          [e["revision"] for e in chain["revisions"]] == [1, 2]
+          and chain["revisions"][0]["writer_version"] == 2
+          and chain["revisions"][1]["writer_version"] == 3
+          and len(chain["corrections"]) == 1)
+    r = web.post("/api/events/decode",
+                 json={"event_id": old_event, "analyzer_id": "analyzer-a"}).json()
+    check("historical revision decodable in its original format",
+          r["result"]["decoded_ok"]
+          and r["result"]["datum"]["measurement"] == 7.0)
+    r = web.post("/api/corrections", json={
+        "entity_id": entity, "seen_revision": 1, "seen_writer_fp": fp,
+        "payload": {"sample_id": "S-3", "project": "P3", "measurement": 9.9},
+        "reason": "stale duplicate"})
+    check("stale seen revision rejected 409",
+          r.status_code == 409 and "所见修订" in r.json()["error"],
+          r.json().get("error", ""))
+    mine = next(e for e in web.get("/api/events/current").json()["current_events"]
+                if e["entity_id"] == entity)
+    check("current event unchanged after rejected correction",
+          mine["revision"] == 2 and mine["payload"]["measurement"] == 7.5)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

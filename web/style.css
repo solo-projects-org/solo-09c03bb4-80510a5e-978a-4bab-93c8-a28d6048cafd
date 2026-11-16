@@ -109,5 +109,6 @@ th { background: #f2f5f9; }
 td pre { max-height: 140px; margin: 0; }
 .msg-ok  { color: #176c3b; font-size: 13px; margin-top: 8px; }
 .msg-err { color: #a02626; font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
+.err-text { color: #a02626; font-size: 12px; }
 .card.fault { border-color: #e6c88f; background: #fffdf6; }
 .pill { font-size: 11px; background: #e8eef7; border-radius: 5px; padding: 1px 6px; margin-left: 4px; }

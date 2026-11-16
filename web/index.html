@@ -79,9 +79,36 @@
     <div id="ingest-msg"></div>
   </section>
 
+  <!-- ================= 事件更正 ================= -->
+  <section class="card">
+    <h2>④ 事件更正（测值录错 → 新修订，原事件字节与格式保留）</h2>
+    <div class="grid2">
+      <div>
+        <label>当前有效事件（分析组现行查询只含最新修订）</label>
+        <select id="corr-entity"></select>
+        <button id="btn-corr-load">载入更正表单</button>
+        <div id="corr-seen" class="hint">尚未载入事件。</div>
+        <label>更正后的完整 JSON（按当前生效写格式编码为新事件）</label>
+        <textarea id="corr-payload" rows="9" placeholder='{"sample_id":"S-1","project":"P","measurement":3.15}'></textarea>
+        <label>更正原因</label>
+        <input id="corr-reason" placeholder="例如：测值录错，3.14 应为 3.15"/>
+        <div class="checkbox-row">
+          <label><input type="checkbox" id="corr-dec-a"/> 更正生效后让 A 解码新事件</label>
+          <label><input type="checkbox" id="corr-dec-b"/> 更正生效后让 B 解码新事件</label>
+        </div>
+        <button id="btn-corr-submit" class="primary">提交更正</button>
+        <div id="corr-msg"></div>
+      </div>
+      <div>
+        <h3>修订链（全部历史修订可追溯、可按原格式交 A/B 解码）</h3>
+        <div id="corr-chain"><div class="hint">先选取并载入一个当前有效事件。</div></div>
+      </div>
+    </div>
+  </section>
+
   <!-- ================= 格式切换 ================= -->
   <section class="card">
-    <h2>④ 格式升级</h2>
+    <h2>⑤ 格式升级</h2>
     <div class="grid2">
       <div>
         <h3>切换写入格式</h3>
@@ -106,10 +133,10 @@
 
   <!-- ================= 留存事件与解码 ================= -->
   <section class="card">
-    <h2>⑤ 留存事件与解码结果</h2>
-    <h3>仓内事件（含写入时格式版本）</h3>
+    <h2>⑥ 留存事件与解码结果（全部历史修订的原字节）</h2>
+    <h3>仓内事件（含写入时格式版本与所属修订）</h3>
     <table id="events-table">
-      <thead><tr><th>事件 ID</th><th>写入版本</th><th>载荷 JSON</th><th>入仓时间</th><th>操作</th></tr></thead>
+      <thead><tr><th>事件 ID</th><th>实体 / 修订</th><th>写入版本</th><th>载荷 JSON</th><th>入仓时间</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table>
     <h3>最近解码结果</h3>
@@ -121,7 +148,7 @@
 
   <!-- ================= 故障注入 ================= -->
   <section class="card fault">
-    <h2>⑥ 故障注入（模拟延迟 / 丢回执）</h2>
+    <h2>⑦ 故障注入（模拟延迟 / 丢回执）</h2>
     <div class="grid2">
       <div>
         <label>全局网络延迟（毫秒，作用于分析服务）</label>

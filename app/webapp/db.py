@@ -27,11 +27,31 @@ CREATE TABLE IF NOT EXISTS writer_state (
 );
 CREATE TABLE IF NOT EXISTS events (
     id                  TEXT PRIMARY KEY,
+    entity_id           TEXT,
+    revision            INTEGER NOT NULL DEFAULT 1,
     writer_fp           TEXT NOT NULL,
     writer_version      INTEGER NOT NULL,
     payload_json        TEXT NOT NULL,
     blob_b64            TEXT NOT NULL,
     ingested_at         TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_current (
+    entity_id           TEXT PRIMARY KEY,
+    event_id            TEXT NOT NULL,
+    revision            INTEGER NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_corrections (
+    correction_id       TEXT PRIMARY KEY,
+    entity_id           TEXT NOT NULL,
+    old_event_id        TEXT NOT NULL,
+    new_event_id        TEXT NOT NULL,
+    seen_revision       INTEGER NOT NULL,
+    new_revision        INTEGER NOT NULL,
+    writer_fp           TEXT NOT NULL,
+    writer_version      INTEGER NOT NULL,
+    reason              TEXT NOT NULL,
+    created_at          TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS writer_switches (
     switch_id           TEXT PRIMARY KEY,
@@ -84,6 +104,7 @@ def init(db_path: str) -> None:
     conn = get_conn(db_path)
     try:
         conn.executescript(_DDL)
+        _migrate_events(conn)
         fp = fingerprint(DEFAULT_SCHEMA_V1)
         conn.execute(
             "INSERT OR IGNORE INTO schema_versions(fp, kind, version, schema_json, created_at) "
@@ -101,6 +122,22 @@ def init(db_path: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_events(conn: sqlite3.Connection) -> None:
+    """Bring pre-correction-era databases forward: add the entity/revision
+    columns, treat every retained event as revision 1 of its own entity and
+    backfill the current-pointer table. Old bytes and formats are untouched."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "entity_id" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN entity_id TEXT")
+    if "revision" not in cols:
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    conn.execute("UPDATE events SET entity_id = id WHERE entity_id IS NULL")
+    conn.execute(
+        "INSERT OR IGNORE INTO event_current(entity_id, event_id, revision, updated_at) "
+        "SELECT entity_id, id, revision, ingested_at FROM events")
 
 
 # ----- schemas --------------------------------------------------------------
@@ -158,13 +195,14 @@ def set_writer_state(conn: sqlite3.Connection, fp: str, version: int) -> None:
 # ----- events ---------------------------------------------------------------
 
 def insert_event(conn: sqlite3.Connection, *, writer_fp: str, writer_version: int,
-                 payload: Dict[str, Any], blob_b64: str) -> str:
+                 payload: Dict[str, Any], blob_b64: str,
+                 entity_id: Optional[str] = None, revision: int = 1) -> str:
     event_id = "evt_" + uuid.uuid4().hex[:12]
     conn.execute(
-        "INSERT INTO events(id, writer_fp, writer_version, payload_json, blob_b64, ingested_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (event_id, writer_fp, writer_version, json.dumps(payload, ensure_ascii=False),
-         blob_b64, _now()),
+        "INSERT INTO events(id, entity_id, revision, writer_fp, writer_version, "
+        "payload_json, blob_b64, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (event_id, entity_id or event_id, revision, writer_fp, writer_version,
+         json.dumps(payload, ensure_ascii=False), blob_b64, _now()),
     )
     return event_id
 
@@ -177,6 +215,83 @@ def list_events(conn: sqlite3.Connection) -> List[sqlite3.Row]:
 
 def get_event(conn: sqlite3.Connection, event_id: str) -> Optional[sqlite3.Row]:
     return conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+
+
+def list_entity_events(conn: sqlite3.Connection, entity_id: str) -> List[sqlite3.Row]:
+    """Every retained revision of one entity, oldest first (the chain)."""
+    return conn.execute(
+        "SELECT * FROM events WHERE entity_id = ? ORDER BY revision, rowid",
+        (entity_id,),
+    ).fetchall()
+
+
+# ----- current pointer (analysts see only the latest revision) ---------------
+
+def set_current(conn: sqlite3.Connection, entity_id: str, event_id: str,
+                revision: int) -> None:
+    conn.execute(
+        "INSERT INTO event_current(entity_id, event_id, revision, updated_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET "
+        "event_id = excluded.event_id, revision = excluded.revision, "
+        "updated_at = excluded.updated_at",
+        (entity_id, event_id, revision, _now()),
+    )
+
+
+def get_current(conn: sqlite3.Connection, entity_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM event_current WHERE entity_id = ?", (entity_id,),
+    ).fetchone()
+
+
+def advance_current(conn: sqlite3.Connection, entity_id: str, new_event_id: str,
+                    seen_revision: int) -> bool:
+    """Compare-and-swap the current pointer; False iff the revision moved."""
+    cur = conn.execute(
+        "UPDATE event_current SET event_id = ?, revision = revision + 1, "
+        "updated_at = ? WHERE entity_id = ? AND revision = ?",
+        (new_event_id, _now(), entity_id, seen_revision),
+    )
+    return cur.rowcount == 1
+
+
+def list_current_events(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """One row per entity: the event the current pointer references."""
+    return conn.execute(
+        "SELECT e.* FROM event_current c JOIN events e ON e.id = c.event_id "
+        "ORDER BY c.updated_at DESC, e.rowid DESC"
+    ).fetchall()
+
+
+# ----- corrections (revision relation audit) ---------------------------------
+
+def insert_correction(conn: sqlite3.Connection, *, entity_id: str,
+                      old_event_id: str, new_event_id: str, seen_revision: int,
+                      new_revision: int, writer_fp: str, writer_version: int,
+                      reason: str) -> str:
+    correction_id = "cor_" + uuid.uuid4().hex[:12]
+    conn.execute(
+        "INSERT INTO event_corrections(correction_id, entity_id, old_event_id, "
+        "new_event_id, seen_revision, new_revision, writer_fp, writer_version, "
+        "reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (correction_id, entity_id, old_event_id, new_event_id, seen_revision,
+         new_revision, writer_fp, writer_version, reason, _now()),
+    )
+    return correction_id
+
+
+def list_corrections(conn: sqlite3.Connection, entity_id: Optional[str] = None,
+                     limit: int = 50) -> List[sqlite3.Row]:
+    if entity_id is not None:
+        return conn.execute(
+            "SELECT * FROM event_corrections WHERE entity_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (entity_id, limit),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM event_corrections ORDER BY created_at DESC, rowid DESC "
+        "LIMIT ?", (limit,),
+    ).fetchall()
 
 
 # ----- switches -------------------------------------------------------------

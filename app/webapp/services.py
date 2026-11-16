@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import uuid
 from typing import Any, Dict, List
 
 from ..avro_codec import (CodecError, SchemaError, encode, fingerprint,
@@ -50,6 +51,14 @@ from .analyzer_client import ANALYZER_ORDER, AnalyzerClient, RemoteError
 
 class GuardError(Exception):
     """A precondition/compatibility guard rejected the request."""
+
+
+class StaleCorrection(GuardError):
+    """The seen revision or the seen write format was stale -> HTTP 409."""
+
+
+class UnknownEntity(GuardError):
+    """The correction targets an entity with no current event -> HTTP 404."""
 
 
 class SwitchService:
@@ -445,7 +454,8 @@ class SwitchService:
 
         Works regardless of any pending switch: only the confirmed effective
         writer pointer is ever used, so interleaved compatible events are never
-        blocked or missed."""
+        blocked or missed. Each ingested event starts revision 1 of a new
+        entity; the event row and its current pointer land in one transaction."""
         with self._conn() as conn:
             state = db.get_writer_state(conn)
             writer_schema = db.get_schema_by_fp(conn, state["effective_fp"])
@@ -454,14 +464,132 @@ class SwitchService:
         except CodecError as exc:
             raise GuardError(str(exc))
         blob_b64 = base64.b64encode(blob).decode("ascii")
+        entity_id = "ent_" + uuid.uuid4().hex[:12]
         with self._conn() as conn:
             event_id = db.insert_event(
                 conn, writer_fp=state["effective_fp"],
                 writer_version=state["effective_version"],
-                payload=payload, blob_b64=blob_b64)
+                payload=payload, blob_b64=blob_b64,
+                entity_id=entity_id, revision=1)
+            db.set_current(conn, entity_id, event_id, 1)
             conn.commit()
-        return {"event_id": event_id, "writer_version": state["effective_version"],
+        return {"event_id": event_id, "entity_id": entity_id, "revision": 1,
+                "writer_version": state["effective_version"],
                 "writer_fp": state["effective_fp"], "size_bytes": len(blob)}
+
+    # ======================================================================
+    # Event corrections (revision chain)
+    # ======================================================================
+
+    def correct_event(self, *, entity_id: str, seen_revision: int,
+                      seen_writer_fp: str, payload: Dict[str, Any],
+                      reason: str) -> Dict[str, Any]:
+        """Atomically replace an entity's current event with a corrected one.
+
+        One ``BEGIN IMMEDIATE`` transaction: verify the seen revision and the
+        seen write format are still current, encode the corrected record with
+        the *effective* write format, then insert the new event, move the
+        current pointer (compare-and-swap) and write the revision relation.
+        All three take effect together; any failure rolls everything back, so
+        the original current event remains readable. Old bytes, old formats
+        and historical decode records are never touched.
+
+        Interleavings: the service lock plus SQLite's write lock serialise
+        this against writer switches and other corrections, so a stale
+        ``seen_revision`` (another correction landed) or a stale
+        ``seen_writer_fp`` (a write-format switch landed) is rejected instead
+        of silently committing on top of a newer state.
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise GuardError("更正原因不能为空")
+        if not isinstance(payload, dict) or not payload:
+            raise GuardError("更正载荷为空：请提交更正后的完整 Avro record JSON")
+        with self._lock:
+            conn = self._conn()
+            try:
+                # Write lock up front: no switch/correction can commit between
+                # our staleness checks and the atomic apply.
+                conn.execute("BEGIN IMMEDIATE")
+                cur = db.get_current(conn, entity_id)
+                if cur is None:
+                    raise UnknownEntity(
+                        f"实体 '{entity_id}' 不存在或没有当前事件；"
+                        "请从当前有效事件列表选取")
+                if cur["revision"] != seen_revision:
+                    raise StaleCorrection(
+                        f"所见修订 v{seen_revision} 已过期：实体 {entity_id} "
+                        f"的当前修订已是 v{cur['revision']}（另一笔更正先生效）；"
+                        "请刷新修订链后基于最新修订重新提交")
+                state = db.get_writer_state(conn)
+                if state["effective_fp"] != seen_writer_fp:
+                    raise StaleCorrection(
+                        f"所见写格式已过期：表单基于 fp={seen_writer_fp[:8]}，"
+                        f"当前生效写格式为 v{state['effective_version']} "
+                        f"fp={state['effective_fp'][:8]}（期间发生了写格式切换）；"
+                        "请按新生效格式重新载入并提交")
+                writer_schema = db.get_schema_by_fp(conn, state["effective_fp"])
+                try:
+                    blob = encode(writer_schema, payload)
+                except CodecError as exc:
+                    raise GuardError(str(exc))
+                blob_b64 = base64.b64encode(blob).decode("ascii")
+                new_revision = cur["revision"] + 1
+                new_event_id = db.insert_event(
+                    conn, writer_fp=state["effective_fp"],
+                    writer_version=state["effective_version"],
+                    payload=payload, blob_b64=blob_b64,
+                    entity_id=entity_id, revision=new_revision)
+                if not db.advance_current(conn, entity_id, new_event_id,
+                                          cur["revision"]):
+                    raise StaleCorrection(
+                        "当前指向在提交期间被另一笔更正移动，本次更正未生效")
+                correction_id = db.insert_correction(
+                    conn, entity_id=entity_id, old_event_id=cur["event_id"],
+                    new_event_id=new_event_id, seen_revision=seen_revision,
+                    new_revision=new_revision, writer_fp=state["effective_fp"],
+                    writer_version=state["effective_version"], reason=reason)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return {
+            "correction_id": correction_id,
+            "entity_id": entity_id,
+            "old_event_id": cur["event_id"],
+            "new_event_id": new_event_id,
+            "revision": new_revision,
+            "writer_version": state["effective_version"],
+            "writer_fp": state["effective_fp"],
+            "size_bytes": len(blob),
+        }
+
+    def current_events(self) -> List[Dict[str, Any]]:
+        """The analysts' view: exactly one (latest) revision per entity."""
+        with self._conn() as conn:
+            return [self._event_view(r, is_current=True)
+                    for r in db.list_current_events(conn)]
+
+    def revision_chain(self, entity_id: str) -> Dict[str, Any]:
+        """The whole revision chain of one entity plus its correction audit."""
+        with self._conn() as conn:
+            cur = db.get_current(conn, entity_id)
+            if cur is None:
+                raise UnknownEntity(f"实体 '{entity_id}' 不存在或没有当前事件")
+            revisions = [
+                self._event_view(r, is_current=(r["id"] == cur["event_id"]))
+                for r in db.list_entity_events(conn, entity_id)
+            ]
+            corrections = [dict(r) for r in db.list_corrections(conn, entity_id)]
+        return {
+            "entity_id": entity_id,
+            "current_event_id": cur["event_id"],
+            "current_revision": cur["revision"],
+            "revisions": revisions,
+            "corrections": corrections,
+        }
 
     def decode_event(self, event_id: str, analyzer_id: str) -> Dict[str, Any]:
         if analyzer_id not in self.clients:
@@ -496,10 +624,13 @@ class SwitchService:
         with self._conn() as conn:
             state = db.get_writer_state(conn)
             writer_schema = db.get_schema_by_fp(conn, state["effective_fp"])
-            events = [dict(e) for e in db.list_events(conn)]
-            for e in events:
-                e["payload"] = json.loads(e.pop("payload_json"))
-                e.pop("blob_b64", None)
+            current_rows = db.list_current_events(conn)
+            current_ids = {r["id"] for r in current_rows}
+            events = [self._event_view(e, is_current=e["id"] in current_ids)
+                      for e in db.list_events(conn)]
+            current_events = [self._event_view(r, is_current=True)
+                              for r in current_rows]
+            corrections = [dict(r) for r in db.list_corrections(conn)]
             wsw = [self._writer_switch_view(r)
                    for r in conn.execute(
                        "SELECT * FROM writer_switches ORDER BY rowid DESC LIMIT 10")]
@@ -535,12 +666,22 @@ class SwitchService:
             },
             "analyzers": analyzers,
             "events": events,
+            "current_events": current_events,
+            "corrections": corrections,
             "writer_switches": wsw,
             "reader_switches": rsw,
             "decode_results": decodes,
             "simulation": sim,
             "writer_schemas": schemas,
         }
+
+    @staticmethod
+    def _event_view(row, *, is_current: bool) -> Dict[str, Any]:
+        d = dict(row)
+        d["payload"] = json.loads(d.pop("payload_json"))
+        d.pop("blob_b64", None)
+        d["is_current"] = is_current
+        return d
 
     @staticmethod
     def _writer_switch_view(row) -> Dict[str, Any]:

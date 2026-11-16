@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from ..avro_codec import DEFAULT_SCHEMA_V1
 from . import db
 from .analyzer_client import ANALYZER_ORDER, build_clients
-from .services import GuardError, SwitchService
+from .services import GuardError, StaleCorrection, SwitchService, UnknownEntity
 
 DB_PATH = os.environ.get("WEBAPP_DB", "/data/webapp.db")
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
@@ -115,6 +115,16 @@ class DecodeIn(BaseModel):
     analyzer_id: str
 
 
+class CorrectionIn(BaseModel):
+    entity_id: str = Field(..., description="要更正的实体（当前有效事件所属）")
+    seen_revision: int = Field(..., ge=1, description="载入表单时所见修订号")
+    seen_writer_fp: str = Field(..., description="载入表单时生效写格式指纹")
+    payload: Dict[str, Any] = Field(..., description="更正后的完整 Avro record JSON")
+    reason: str = Field(..., description="更正原因")
+    decode_on: Optional[List[str]] = Field(
+        None, description="可选：更正生效后让指定分析服务解码新事件")
+
+
 # --- helpers ----------------------------------------------------------------
 
 def _guard_response(exc: GuardError, status: int = 409) -> JSONResponse:
@@ -196,6 +206,58 @@ def decode_existing(req: DecodeIn):
             status_code=502,
             content={"ok": False,
                      "error": f"decode call unconfirmed: {exc}"})
+
+
+# --- corrections (revision chain) -------------------------------------------
+
+@app.get("/api/events/current")
+def current_events():
+    """Analysts' current-event query: only the latest revision per entity."""
+    return {"ok": True, "current_events": service.current_events()}
+
+
+@app.get("/api/entities/{entity_id}/revisions")
+def entity_revisions(entity_id: str):
+    """The whole revision chain of one entity (web traceability view)."""
+    try:
+        return {"ok": True, "chain": service.revision_chain(entity_id)}
+    except UnknownEntity as exc:
+        return _guard_response(exc, 404)
+
+
+@app.post("/api/corrections")
+def correct_event(req: CorrectionIn):
+    """Submit a correction: new event + revision relation + current pointer
+    take effect atomically; stale seen revision/write format is rejected and
+    the original current event stays readable."""
+    try:
+        result = service.correct_event(
+            entity_id=req.entity_id, seen_revision=req.seen_revision,
+            seen_writer_fp=req.seen_writer_fp, payload=req.payload,
+            reason=req.reason)
+    except StaleCorrection as exc:
+        return _guard_response(exc, 409)
+    except UnknownEntity as exc:
+        return _guard_response(exc, 404)
+    except GuardError as exc:
+        return _guard_response(exc, 422)
+
+    decodes = []
+    for analyzer_id in (req.decode_on or []):
+        if analyzer_id not in _analyzer_urls():
+            decodes.append({"analyzer_id": analyzer_id,
+                            "error": "unknown analyzer"})
+            continue
+        try:
+            decodes.append(service.decode_event(result["new_event_id"],
+                                                analyzer_id))
+        except GuardError as exc:
+            decodes.append({"analyzer_id": analyzer_id, "error": str(exc)})
+        except Exception as exc:
+            decodes.append({"analyzer_id": analyzer_id,
+                            "error": f"decode call unconfirmed: {exc}"})
+    result["decodes"] = decodes
+    return {"ok": True, **result}
 
 
 # --- switches ---------------------------------------------------------------
